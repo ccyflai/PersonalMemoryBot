@@ -6,14 +6,14 @@ from typing import Any, Dict, List
 
 import openai
 import streamlit as st
-from langchain import LLMChain, OpenAI
+from langchain import LLMChain
 from langchain.agents import AgentExecutor, Tool, ZeroShotAgent
 from langchain.chains import RetrievalQA
 from langchain.chains.question_answering import load_qa_chain
 from langchain.docstore.document import Document
 from langchain.document_loaders import PyPDFLoader
 from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.llms import OpenAI
+from langchain.chat_models import AzureChatOpenAI
 from langchain.memory import ConversationBufferMemory
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import VectorStore
@@ -75,7 +75,10 @@ def text_to_docs(text: str) -> List[Document]:
 # Define a function for the embeddings
 @st.cache_data
 def test_embed():
-    embeddings = OpenAIEmbeddings(openai_api_key=api)
+    embeddings = OpenAIEmbeddings(
+        deployment="text-embedding-ada-002",
+        chunk_size=1
+    )
     # Indexing
     # Save in a Vector DB
     with st.spinner("It's indexing..."):
@@ -133,19 +136,12 @@ if uploaded_file:
                 label="Select Page", min_value=1, max_value=len(pages), step=1
             )
             pages[page_sel - 1]
-        # Allow the user to enter an OpenAI API key
-        api = st.text_input(
-            "**Enter OpenAI API Key**",
-            type="password",
-            placeholder="sk-",
-            help="https://platform.openai.com/account/api-keys",
-        )
-        if api:
+        if True:
             # Test the embeddings and save the index in a vector database
             index = test_embed()
             # Set up the question-answering system
             qa = RetrievalQA.from_chain_type(
-                llm=OpenAI(openai_api_key=api),
+                llm=AzureChatOpenAI(deployment_name="gpt-35-turbo"),
                 chain_type = "map_reduce",
                 retriever=index.as_retriever(),
             )
@@ -178,8 +174,8 @@ if uploaded_file:
                 )
 
             llm_chain = LLMChain(
-                llm=OpenAI(
-                    temperature=0, openai_api_key=api, model_name="gpt-3.5-turbo"
+                llm=AzureChatOpenAI(
+                    temperature=0, deployment_name="gpt-35-turbo", model_name="gpt-3.5-turbo"
                 ),
                 prompt=prompt,
             )
