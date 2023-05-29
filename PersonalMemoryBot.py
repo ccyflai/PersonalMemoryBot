@@ -93,7 +93,7 @@ st.markdown(
     """ 
         ####  🗨️ Chat with your PDF files 📜 with `Conversational Buffer Memory`  
         > *powered by [LangChain]('https://langchain.readthedocs.io/en/latest/modules/memory.html#memory') + 
-        [OpenAI]('https://platform.openai.com/docs/models/gpt-3-5') + [DataButton](https://www.databutton.io/)*
+        [OpenAI]('https://platform.openai.com/docs/models/gpt-3-5') + [Streamlit](https://streamlit.io/)*
         ----
         """
 )
@@ -110,17 +110,6 @@ st.markdown(
     """
 )
 
-# Set up the sidebar
-st.sidebar.markdown(
-    """
-    ### Steps:
-    1. Upload PDF File
-    2. Enter Your Secret Key for Embeddings
-    3. Perform Q&A
-
-    **Note : File content and API key not stored in any form.**
-    """
-)
 
 # Allow the user to upload a PDF file
 uploaded_file = st.file_uploader("**Upload Your PDF File**", type=["pdf"])
@@ -200,8 +189,3 @@ if uploaded_file:
             # Allow the user to view the conversation history and other information stored in the agent's memory
             with st.expander("History/Memory"):
                 st.session_state.memory
-
-# Add a video and a link to a blog post in the sidebar
-with st.sidebar:
-    st.video("https://youtu.be/daMNGGPJkEE")
-    st.markdown("*Codes with a blog post will be available soon.*")
