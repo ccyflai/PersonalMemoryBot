@@ -1,30 +1,25 @@
 # Import necessary modules
 import re
-import time
-from io import BytesIO
-from typing import Any, Dict, List
+from typing import List
 
-import openai
-import streamlit as st
-from langchain import LLMChain
-from langchain.agents import AgentExecutor, Tool, ZeroShotAgent
-from langchain.chains import RetrievalQA
-from langchain.chains.question_answering import load_qa_chain
-from langchain.docstore.document import Document
-from langchain.document_loaders import PyPDFLoader
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.chat_models import AzureChatOpenAI
-from langchain.memory import ConversationBufferMemory
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import VectorStore
-from langchain.vectorstores.faiss import FAISS
+import chainlit as cl
+from langchain.agents import create_agent
+from langchain_classic.chains import create_retrieval_chain
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.tools import tool
+from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langgraph.checkpoint.memory import InMemorySaver
 from pypdf import PdfReader
 
 
-# Define a function to parse a PDF file and extract its text content
-@st.cache_data
-def parse_pdf(file: BytesIO) -> List[str]:
-    pdf = PdfReader(file)
+# Parse a PDF file and extract its text content per page
+def parse_pdf(path: str) -> List[str]:
+    pdf = PdfReader(path)
     output = []
     for page in pdf.pages:
         text = page.extract_text()
@@ -38,14 +33,9 @@ def parse_pdf(file: BytesIO) -> List[str]:
     return output
 
 
-# Define a function to convert text content to a list of documents
-@st.cache_data
-def text_to_docs(text: str) -> List[Document]:
-    """Converts a string or list of strings to a list of Documents
-    with metadata."""
-    if isinstance(text, str):
-        # Take a single string as one page
-        text = [text]
+# Convert a list of page strings to a list of Documents with metadata
+def text_to_docs(text: List[str]) -> List[Document]:
+    """Converts a list of page strings to a list of Documents with metadata."""
     page_docs = [Document(page_content=page) for page in text]
 
     # Add page numbers as metadata
@@ -54,7 +44,6 @@ def text_to_docs(text: str) -> List[Document]:
 
     # Split pages into chunks
     doc_chunks = []
-
     for doc in page_docs:
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=2000,
@@ -63,129 +52,153 @@ def text_to_docs(text: str) -> List[Document]:
         )
         chunks = text_splitter.split_text(doc.page_content)
         for i, chunk in enumerate(chunks):
-            doc = Document(
-                page_content=chunk, metadata={"page": doc.metadata["page"], "chunk": i}
+            chunk_doc = Document(
+                page_content=chunk,
+                metadata={"page": doc.metadata["page"], "chunk": i},
             )
-            # Add sources a metadata
-            doc.metadata["source"] = f"{doc.metadata['page']}-{doc.metadata['chunk']}"
-            doc_chunks.append(doc)
+            # Add source as metadata
+            chunk_doc.metadata["source"] = (
+                f"{chunk_doc.metadata['page']}-{chunk_doc.metadata['chunk']}"
+            )
+            doc_chunks.append(chunk_doc)
     return doc_chunks
 
 
-# Define a function for the embeddings
-@st.cache_data
-def test_embed():
-    embeddings = OpenAIEmbeddings(
-        deployment="text-embedding-ada-002",
-        chunk_size=1
+# Build a FAISS vector index from document chunks
+async def build_index(pages: List[Document]) -> FAISS:
+    embeddings = AzureOpenAIEmbeddings(
+        azure_deployment="text-embedding-ada-002",
+        chunk_size=1,
     )
-    # Indexing
-    # Save in a Vector DB
-    with st.spinner("It's indexing..."):
+    try:
         index = FAISS.from_documents(pages, embeddings)
-    st.success("Embeddings done.", icon="✅")
+    except Exception as e:
+        raise RuntimeError(f"Failed to build index: {e}") from e
     return index
 
 
-# Set up the Streamlit app
-st.title("🤖 Personalized Bot with Memory 🧠 ")
-st.markdown(
-    """ 
-        ####  🗨️ Chat with your PDF files 📜 with `Conversational Buffer Memory`  
-        > *powered by [LangChain]('https://langchain.readthedocs.io/en/latest/modules/memory.html#memory') + 
-        [OpenAI]('https://platform.openai.com/docs/models/gpt-3-5') + [Streamlit](https://streamlit.io/)*
-        ----
-        """
-)
+# Build a conversational agent that can answer questions from the PDF index
+def build_agent(index: FAISS) -> object:
+    llm = AzureChatOpenAI(
+        azure_deployment="gpt-35-turbo",
+        model_name="gpt-3.5-turbo",
+        temperature=0,
+    )
 
-st.markdown(
-    """
-    `openai`
-    `langchain`
-    `tiktoken`
-    `pypdf`
-    `faiss-cpu`
-    
-    ---------
-    """
-)
+    # Build the RAG chain used as the agent's PDF tool
+    qa_prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            "Answer the question using only the following context from the PDF:\n\n{context}",
+        ),
+        ("human", "{input}"),
+    ])
+    combine_docs_chain = create_stuff_documents_chain(llm, qa_prompt)
+    retrieval_chain = create_retrieval_chain(index.as_retriever(), combine_docs_chain)
+
+    # Wrap the retrieval chain as a tool callable by the agent
+    @tool
+    def pdf_qa(question: str) -> str:
+        """Answer questions about the uploaded PDF document."""
+        result = retrieval_chain.invoke({"input": question})
+        return result.get("answer", "No answer found.")
+
+    system_prompt = (
+        "You are a helpful assistant that answers questions about an uploaded PDF document. "
+        "Use the pdf_qa tool to look up information from the document. "
+        "Always ground your answers in what the document says."
+    )
+
+    # create_agent (LangChain 1.x) returns a compiled LangGraph agent.
+    # Conversation history is managed automatically via the InMemorySaver checkpointer.
+    agent = create_agent(
+        model=llm,
+        tools=[pdf_qa],
+        system_prompt=system_prompt,
+        checkpointer=InMemorySaver(),
+    )
+    return agent
 
 
-# Allow the user to upload a PDF file
-uploaded_file = st.file_uploader("**Upload Your PDF File**", type=["pdf"])
+@cl.on_chat_start
+async def on_chat_start() -> None:
+    """Prompt the user to upload a PDF, then build the index and agent."""
+    files = await cl.AskFileMessage(
+        content="Welcome to **PersonalMemoryBot**! Upload a PDF to get started.",
+        accept=["application/pdf"],
+        max_size_mb=20,
+    ).send()
 
-if uploaded_file:
-    name_of_file = uploaded_file.name
-    doc = parse_pdf(uploaded_file)
-    pages = text_to_docs(doc)
-    if pages:
-        # Allow the user to select a page and view its content
-        with st.expander("Show Page Content", expanded=False):
-            page_sel = st.number_input(
-                label="Select Page", min_value=1, max_value=len(pages), step=1
+    pdf_file = files[0]
+    name_of_file = pdf_file.name
+
+    await cl.Message(content=f"Processing `{name_of_file}`...").send()
+
+    # Parse and chunk the PDF
+    try:
+        raw_pages = parse_pdf(pdf_file.path)
+        pages = text_to_docs(raw_pages)
+    except Exception as e:
+        await cl.Message(content=f"Failed to parse PDF: {e}").send()
+        return
+
+    if not pages:
+        await cl.Message(content="Could not extract any text from the PDF.").send()
+        return
+
+    # Build the FAISS index
+    async with cl.Step(name="Indexing document") as step:
+        try:
+            index = await build_index(pages)
+            step.output = "Embeddings built successfully."
+        except RuntimeError as e:
+            await cl.Message(content=str(e)).send()
+            return
+
+    # Build the agent (includes its own InMemorySaver for conversation history)
+    try:
+        agent = build_agent(index)
+    except Exception as e:
+        await cl.Message(content=f"Failed to build agent: {e}").send()
+        return
+
+    # Persist agent and a fixed thread_id for the session
+    cl.user_session.set("agent", agent)
+    cl.user_session.set("thread_id", "session")
+    cl.user_session.set("file_name", name_of_file)
+
+    await cl.Message(
+        content=f"Ready! Ask me anything about `{name_of_file}`."
+    ).send()
+
+
+@cl.on_message
+async def on_message(message: cl.Message) -> None:
+    """Handle each user message by running the conversational agent."""
+    agent = cl.user_session.get("agent")
+    thread_id = cl.user_session.get("thread_id")
+
+    if agent is None:
+        await cl.Message(
+            content="No document loaded. Please restart the chat and upload a PDF."
+        ).send()
+        return
+
+    config = {"configurable": {"thread_id": thread_id}}
+
+    async with cl.Step(name="Thinking"):
+        try:
+            result = await cl.make_async(agent.invoke)(
+                {"messages": [HumanMessage(content=message.content)]},
+                config=config,
             )
-            pages[page_sel - 1]
-        if True:
-            # Test the embeddings and save the index in a vector database
-            index = test_embed()
-            # Set up the question-answering system
-            qa = RetrievalQA.from_chain_type(
-                llm=AzureChatOpenAI(deployment_name="gpt-35-turbo"),
-                chain_type = "map_reduce",
-                retriever=index.as_retriever(),
-            )
-            # Set up the conversational agent
-            tools = [
-                Tool(
-                    name="State of Union QA System",
-                    func=qa.run,
-                    description="Useful for when you need to answer questions about the aspects asked. Input may be a partial or fully formed question.",
-                )
+            # The agent returns a state dict; the last AIMessage is the response
+            ai_messages = [
+                m for m in result.get("messages", []) if isinstance(m, AIMessage)
             ]
-            prefix = """Have a conversation with a human, answering the following questions as best you can based on the context and memory available. 
-                        You have access to a single tool:"""
-            suffix = """Begin!"
+            res = ai_messages[-1].content if ai_messages else "No response generated."
+        except Exception as e:
+            await cl.Message(content=f"Error generating response: {e}").send()
+            return
 
-            {chat_history}
-            Question: {input}
-            {agent_scratchpad}"""
-
-            prompt = ZeroShotAgent.create_prompt(
-                tools,
-                prefix=prefix,
-                suffix=suffix,
-                input_variables=["input", "chat_history", "agent_scratchpad"],
-            )
-
-            if "memory" not in st.session_state:
-                st.session_state.memory = ConversationBufferMemory(
-                    memory_key="chat_history"
-                )
-
-            llm_chain = LLMChain(
-                llm=AzureChatOpenAI(
-                    temperature=0, deployment_name="gpt-35-turbo", model_name="gpt-3.5-turbo"
-                ),
-                prompt=prompt,
-            )
-            agent = ZeroShotAgent(llm_chain=llm_chain, tools=tools, verbose=True)
-            agent_chain = AgentExecutor.from_agent_and_tools(
-                agent=agent, tools=tools, verbose=True, memory=st.session_state.memory
-            )
-
-            # Allow the user to enter a query and generate a response
-            query = st.text_input(
-                "**What's on your mind?**",
-                placeholder="Ask me anything from {}".format(name_of_file),
-            )
-
-            if query:
-                with st.spinner(
-                    "Generating Answer to your Query : `{}` ".format(query)
-                ):
-                    res = agent_chain.run(query)
-                    st.info(res, icon="🤖")
-
-            # Allow the user to view the conversation history and other information stored in the agent's memory
-            with st.expander("History/Memory"):
-                st.session_state.memory
+    await cl.Message(content=res).send()

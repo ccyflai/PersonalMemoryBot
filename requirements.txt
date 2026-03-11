@@ -1,6 +1,11 @@
-langchain
-openai
-tiktoken
+chainlit
 faiss-cpu
+langchain==1.2.11
+langchain-classic
+langchain-community==0.4.1
+langchain-core==1.2.18
+langchain-openai==1.1.11
+langchain-text-splitters==1.1.1
+langgraph
 pypdf
-streamlit
+tiktoken
